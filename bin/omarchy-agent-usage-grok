@@ -1,0 +1,640 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the Grok usage record as JSON
+# omarchy:args=[--force] [--limits-only]
+# omarchy:hidden=true
+"""Collect Grok CLI usage into one display-ready JSON record.
+
+Local stats come from the native Grok CLI session files and from opencode
+sessions that ran on an xAI provider; the credit ledger comes from the CLI
+chat proxy's billing endpoint. The agents panel only ever reads the JSON
+this prints.
+"""
+
+import argparse
+import base64
+import fcntl
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+AGENT_ID = "grok"
+AGENT_NAME = "Grok"
+AUTH_HELP = "Run `grok login` to authenticate."
+
+# The CLI's own chat proxy. models_cache.json records it as the origin of the
+# model list, and the billing ledger hangs off the same base.
+API_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
+HTTP_TIMEOUT = 8
+
+# Native session transcripts older than this are not read. Grok writes every
+# stream update into updates.jsonl, so a long history is large on disk and
+# scanning all of it would cost more than the numbers are worth. The Codex
+# collector draws the same 30-day line, and the README documents what it
+# means for the all-time totals.
+SESSION_MAX_AGE_DAYS = 30
+
+# A scan this recent is only reused to dedup concurrent collector runs (the
+# update command backgrounds one per agent while the panel refreshes on its
+# own); every periodic widget refresh lands a real rescan, however low
+# refreshIntervalSec is set. --limits-only promises only fresh limits, so it
+# may reuse a scan for up to 15 minutes.
+SCAN_REUSE_SECONDS = 20
+LIMITS_ONLY_REUSE_SECONDS = 900
+
+
+def number(value):
+  try:
+    return int(value or 0)
+  except Exception:
+    return 0
+
+
+def model_name(raw):
+  value = str(raw or "grok").strip()
+  return value if value else "grok"
+
+
+def local_day(value):
+  if value is None:
+    return datetime.now().strftime("%Y-%m-%d")
+  if isinstance(value, (int, float)):
+    # Grok's session update timestamps are seconds; _meta carries milliseconds.
+    if value > 10_000_000_000:
+      value = value / 1000
+    return datetime.fromtimestamp(value).strftime("%Y-%m-%d")
+  text = str(value)
+  try:
+    if text.endswith("Z"):
+      dt = datetime.fromisoformat(text[:-1] + "+00:00")
+    else:
+      dt = datetime.fromisoformat(text)
+    if dt.tzinfo is not None:
+      dt = dt.astimezone()
+    return dt.strftime("%Y-%m-%d")
+  except Exception:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def grok_home():
+  return Path(os.environ.get("GROK_HOME") or (Path.home() / ".grok"))
+
+
+now = datetime.now()
+today = now.strftime("%Y-%m-%d")
+recent_dates = [(now - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(6, -1, -1)]
+recent = {day: {"date": day, "messageCount": 0} for day in recent_dates}
+today_tokens_by_model = {}
+model_usage = {}
+today_sessions = set()
+active_days = set()
+
+today_prompts = 0
+today_total_tokens = 0
+total_prompts = 0
+total_sessions = set()
+seen_turns = set()
+
+
+def add_usage(day, session_key, model, input_tokens, output_tokens, cache_read, cache_write, counts_as_prompt):
+  """Fold one model's slice of one turn into the aggregates.
+
+  A single turn can spend tokens on several models, so the caller splits it
+  and the prompt is only counted against the first slice: the panel's prompt
+  count is "how many times did I ask", not "how many models answered".
+  """
+  global today_prompts, today_total_tokens, total_prompts
+  total = input_tokens + output_tokens + cache_read + cache_write
+  if counts_as_prompt:
+    total_prompts += 1
+  total_sessions.add(session_key)
+  active_days.add(day)
+
+  bucket = model_usage.setdefault(model, {
+    "inputTokens": 0,
+    "outputTokens": 0,
+    "cacheReadInputTokens": 0,
+    "cacheCreationInputTokens": 0,
+  })
+  bucket["inputTokens"] += input_tokens
+  bucket["outputTokens"] += output_tokens
+  bucket["cacheReadInputTokens"] += cache_read
+  bucket["cacheCreationInputTokens"] += cache_write
+
+  if day in recent:
+    recent[day]["messageCount"] += total
+
+  if day == today:
+    if counts_as_prompt:
+      today_prompts += 1
+    today_sessions.add(session_key)
+    today_total_tokens += total
+    today_tokens_by_model[model] = today_tokens_by_model.get(model, 0) + total
+
+
+def split_usage(usage):
+  """Turn one Grok usage block into (input, output, cache_read, cache_write).
+
+  Grok reports totalTokens == inputTokens + outputTokens, so cachedReadTokens
+  and cacheCreationTokens are a subset of inputTokens rather than categories
+  beside it — the same shape Codex reports. Subtract them out so the panel's
+  cache split does not count those tokens twice. reasoningTokens is likewise
+  already inside outputTokens, and is deliberately not added on top.
+  """
+  cache_read = number(usage.get("cachedReadTokens"))
+  cache_write = number(usage.get("cacheCreationTokens"))
+  input_tokens = max(0, number(usage.get("inputTokens")) - cache_read - cache_write)
+  output_tokens = number(usage.get("outputTokens"))
+  return input_tokens, output_tokens, cache_read, cache_write
+
+
+def scan_native_grok_sessions():
+  """Read turn_completed updates out of the native Grok session transcripts.
+
+  Layout is ~/.grok/sessions/<url-encoded cwd>/<session uuid>/updates.jsonl,
+  one JSON-RPC notification per line. Only turn_completed carries a usage
+  block, so the substring test in front of json.loads keeps the scan from
+  parsing the far larger stream of text deltas around it.
+  """
+  root = grok_home() / "sessions"
+  if not root.is_dir():
+    return
+
+  cutoff = time.time() - SESSION_MAX_AGE_DAYS * 24 * 60 * 60
+  for path in sorted(root.glob("*/*/updates.jsonl")):
+    try:
+      if path.stat().st_mtime < cutoff:
+        continue
+    except OSError:
+      continue
+
+    session_key = str(path.parent)
+    try:
+      with path.open(errors="replace") as handle:
+        for index, raw in enumerate(handle):
+          if "turn_completed" not in raw:
+            continue
+          try:
+            entry = json.loads(raw)
+          except Exception:
+            continue
+          update = ((entry.get("params") or {}).get("update")) or {}
+          if update.get("sessionUpdate") != "turn_completed":
+            continue
+          usage = update.get("usage") or {}
+          if not usage:
+            continue
+
+          # prompt_id is a UUID minted per user turn, so it still dedups when
+          # a resumed or forked session carries the transcript forward; the
+          # file position is only the fallback for a turn without one.
+          turn_key = str(update.get("prompt_id") or "") or f"{path}:{index}"
+          if turn_key in seen_turns:
+            continue
+          seen_turns.add(turn_key)
+
+          meta = entry.get("_meta") or {}
+          day = local_day(entry.get("timestamp") or meta.get("agentTimestampMs"))
+
+          # modelUsage splits the turn across the models that actually ran,
+          # which is the breakdown "tokens by model" wants. The flat totals
+          # beside it are the fallback for a turn that carries none.
+          per_model = usage.get("modelUsage")
+          slices = []
+          if isinstance(per_model, dict) and per_model:
+            slices = [(model_name(model), sub) for model, sub in per_model.items() if isinstance(sub, dict)]
+          if not slices:
+            slices = [(model_name(update.get("model_id")), usage)]
+
+          first = True
+          for model, sub in slices:
+            input_tokens, output_tokens, cache_read, cache_write = split_usage(sub)
+            if not (input_tokens or output_tokens or cache_read or cache_write):
+              continue
+            add_usage(day, session_key, model, input_tokens, output_tokens, cache_read, cache_write, first)
+            first = False
+    except OSError:
+      continue
+
+
+def scan_opencode_sessions():
+  """Fold in opencode messages that ran on an xAI provider.
+
+  A subscription burned entirely through opencode leaves no native session
+  files, but opencode records per-message provider, model, and token usage in
+  its own database. Read-only: opencode may be writing right now. Returns
+  whether the scan ran to completion — a scan cut short by a database error
+  still contributes what it read, but must not be cached as the whole story.
+  """
+  db = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")) / "opencode" / "opencode.db"
+  if not db.is_file():
+    return True
+  try:
+    conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+  except sqlite3.Error:
+    return False
+  try:
+    conn.execute("PRAGMA query_only = ON")
+    # The json_extract conditions are the authority for the rows that reach
+    # the Python filter below; the LIKE gates in front are pure acceleration,
+    # so a multi-MB message blob is never parsed just to be discarded.
+    # json_valid guards the parse itself: json_extract() RAISES on malformed
+    # JSON instead of returning NULL, and one such row would otherwise abort
+    # the whole scan. See the Codex collector for the full reasoning — this
+    # is the same query against a different providerID.
+    for session_id, raw in conn.execute(
+      "SELECT session_id, data FROM message"
+      " WHERE data LIKE '%\"role\"%:%\"assistant\"%'"
+      " AND data LIKE '%\"providerID\"%:%\"xai\"%'"
+      " AND CASE WHEN json_valid(data) THEN json_extract(data, '$.role') END = 'assistant'"
+      " AND CASE WHEN json_valid(data) THEN json_extract(data, '$.providerID') END = 'xai'"
+    ):
+      # One malformed row must not abort the scan, so every shape assumption
+      # lives inside the try.
+      try:
+        entry = json.loads(raw)
+        # Exact match: opencode provider ids are free-form, and a custom
+        # "xai-proxy" gateway is not this subscription.
+        if not isinstance(entry, dict) or entry.get("role") != "assistant":
+          continue
+        if str(entry.get("providerID") or "") != "xai":
+          continue
+        tokens = entry.get("tokens") or {}
+        cache = tokens.get("cache") or {}
+        input_tokens = number(tokens.get("input"))
+        # opencode keeps thinking tokens out of output; both are generated.
+        output_tokens = number(tokens.get("output")) + number(tokens.get("reasoning"))
+        cache_read = number(cache.get("read"))
+        cache_write = number(cache.get("write"))
+        if not (input_tokens or output_tokens or cache_read or cache_write):
+          continue
+        day = local_day((entry.get("time") or {}).get("created"))
+        model = model_name(str(entry.get("modelID") or "").rstrip("/").split("/")[-1])
+      except Exception:
+        continue
+      add_usage(day, "opencode:" + str(session_id), model, input_tokens, output_tokens, cache_read, cache_write, True)
+  except sqlite3.Error:
+    # Transient lock, schema migration, corruption: the numbers stop here,
+    # incomplete.
+    return False
+  finally:
+    conn.close()
+  return True
+
+
+def cache_root():
+  root = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")) / "omarchy" / "agent-usage"
+  root.mkdir(parents=True, exist_ok=True)
+  return root
+
+
+def scan_cache_paths():
+  db = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")) / "opencode" / "opencode.db"
+  # The digest covers every data path the scan reads, so a run against a
+  # different GROK_HOME never serves another one's cache.
+  digest = hashlib.sha1((str(grok_home()) + "\n" + str(db)).encode("utf-8")).hexdigest()[:16]
+  root = cache_root()
+  return root / f"grok-scan-{digest}.json", root / f"grok-scan-{digest}.lock"
+
+
+def read_fresh_json(path, max_age_seconds):
+  if max_age_seconds <= 0 or not path.exists():
+    return None
+  try:
+    # A negative age means the mtime is in the future: the clock moved
+    # backwards since the write, so the cache's freshness cannot be trusted.
+    age = time.time() - path.stat().st_mtime
+    if 0 <= age <= max_age_seconds:
+      return json.loads(path.read_text(encoding="utf-8"))
+  except Exception:
+    return None
+  return None
+
+
+def write_json(path, payload):
+  # A temp name unique to this writer, not derived from the target: several
+  # collectors can run at once (the update command backgrounds one per agent,
+  # the panel refreshes on its own), and a shared temp path means the second
+  # replace finds the first one's file already moved away.
+  handle_fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+  tmp = Path(tmp_name)
+  try:
+    with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+      handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    # mkstemp opens at 0600; nothing in the cache is sensitive, so open it
+    # up to the usual 0644.
+    tmp.chmod(0o644)
+    tmp.replace(path)
+  except BaseException:
+    tmp.unlink(missing_ok=True)
+    raise
+
+
+# The cache payload is a versioned envelope around the local-stats dict, so a
+# corrupted or foreign-shaped file is a cache miss (rescan + rewrite) instead
+# of a crash or a garbage record.
+def read_cached_stats(cache_file, max_age_seconds):
+  cached = read_fresh_json(cache_file, max_age_seconds)
+  if not isinstance(cached, dict) or cached.get("schemaVersion") != 1:
+    return None
+  # today* fields only mean "today" on the day they were scanned. A cache
+  # from another local date (midnight passed, or the clock moved) is a miss,
+  # not merely old, whatever its mtime says.
+  if cached.get("scanDate") != today:
+    return None
+  stats = cached.get("stats")
+  if not isinstance(stats, dict):
+    return None
+  if not all(key in stats for key in ("todayPrompts", "todayTotalTokens", "recentDays", "activeDates", "modelUsage")):
+    return None
+  return stats
+
+
+def write_cached_stats(cache_file, stats):
+  try:
+    write_json(cache_file, {"schemaVersion": 1, "scanDate": today, "stats": stats})
+  except Exception as exc:
+    print(f"omarchy-agent-usage-grok: could not write usage cache ({exc})", file=sys.stderr)
+
+
+def local_stats():
+  """Snapshot the aggregated local usage into the record's stats dict."""
+  return {
+    "todayPrompts": today_prompts,
+    "todaySessions": len(today_sessions),
+    "todayTotalTokens": today_total_tokens,
+    "todayTokensByModel": today_tokens_by_model,
+    "recentDays": [recent[day] for day in recent_dates],
+    "totalPrompts": total_prompts,
+    "totalSessions": len(total_sessions),
+    # Days with any recorded usage, for the all-time "N days" summary. The
+    # dates travel too: merging snapshots from several machines needs their
+    # union, which a count alone cannot give.
+    "activeDays": len(active_days),
+    "activeDates": sorted(active_days),
+    "modelUsage": model_usage,
+  }
+
+
+def run_local_scans():
+  scan_native_grok_sessions()
+  complete = scan_opencode_sessions()
+  return local_stats(), complete
+
+
+def cached_local_stats(max_age):
+  """Local stats, with the cache as a pure optimization.
+
+  The cache must never take the collector down: any cache-layer failure
+  (unwritable cache root, lock errors, disk full) degrades to a direct scan
+  and a warning on stderr. The JSON record is the contract; the cache is not.
+  """
+  try:
+    return _cached_local_stats(max_age)
+  except Exception as exc:
+    print(f"omarchy-agent-usage-grok: cache unavailable ({exc}); scanning directly", file=sys.stderr)
+    stats, _ = run_local_scans()
+    return stats
+
+
+def _cached_local_stats(max_age):
+  cache_file, lock_file = scan_cache_paths()
+
+  cached = read_cached_stats(cache_file, max_age)
+  if cached is not None:
+    return cached
+
+  with lock_file.open("w") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    cached = read_cached_stats(cache_file, max_age)
+    if cached is not None:
+      return cached
+    stats, complete = run_local_scans()
+    # An interrupted scan still serves this run, but caching it would
+    # suppress the missing usage for every reader until the cache expires.
+    if complete:
+      write_cached_stats(cache_file, stats)
+    return stats
+
+
+class GrokAuthError(Exception):
+  """The CLI is not signed in, or its token cannot be used from here."""
+
+
+def auth_path():
+  return Path(os.environ.get("GROK_AUTH_PATH") or (grok_home() / "auth.json"))
+
+
+def jwt_claims(token):
+  """Decode a JWT payload without verifying it.
+
+  The signature is the issuer's business; all this needs is the expiry, and
+  reading it locally saves a round trip that was always going to 401.
+  """
+  try:
+    payload = token.split(".")[1]
+    payload += "=" * (-len(payload) % 4)
+    return json.loads(base64.urlsafe_b64decode(payload))
+  except Exception:
+    return {}
+
+
+def read_access_token():
+  """The access token the Grok CLI stored at its last sign-in.
+
+  Read-only, and deliberately never refreshed. auth.json also holds a refresh
+  token, but OIDC refresh tokens rotate on use: spending one here would
+  invalidate the copy the CLI is holding and sign the user out of their own
+  editor. An expired token is reported as such and the collector falls back
+  to local stats, exactly as it does when nobody has ever logged in.
+  """
+  path = auth_path()
+  try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+  except FileNotFoundError:
+    raise GrokAuthError(AUTH_HELP)
+  except Exception:
+    raise GrokAuthError(f"Could not read {path}")
+
+  if not isinstance(payload, dict):
+    raise GrokAuthError(f"Unexpected shape in {path}")
+
+  # One entry per auth scope. Newest usable credential wins, so a stale scope
+  # left behind by an earlier login does not shadow the current one.
+  best = None
+  best_expiry = None
+  for entry in payload.values():
+    if not isinstance(entry, dict):
+      continue
+    token = str(entry.get("key") or "")
+    if not token:
+      continue
+    expiry = number(jwt_claims(token).get("exp"))
+    if best is None or expiry > best_expiry:
+      best, best_expiry = token, expiry
+
+  if best is None:
+    raise GrokAuthError(AUTH_HELP)
+  # A little slack, so a token about to lapse mid-request is treated as gone
+  # rather than spending a round trip to be told so.
+  if best_expiry and best_expiry <= time.time() + 30:
+    raise GrokAuthError("Grok sign-in has expired. Run `grok login` or start the CLI to refresh it.")
+  return best
+
+
+def api_get(base_url, path, token):
+  request = urllib.request.Request(
+    f"{base_url.rstrip('/')}/{path.lstrip('/')}",
+    headers={
+      "Authorization": f"Bearer {token}",
+      "Accept": "application/json",
+      "User-Agent": "omarchy-agent-usage",
+    },
+  )
+  try:
+    with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+      return json.loads(response.read().decode("utf-8"))
+  except urllib.error.HTTPError as error:
+    if error.code in (401, 403):
+      raise GrokAuthError("Grok rejected the stored credentials. Run `grok login`.")
+    raise GrokAuthError(f"Grok API returned HTTP {error.code}")
+  except urllib.error.URLError as error:
+    raise GrokAuthError(f"Grok API unreachable ({error.reason})")
+  except Exception:
+    raise GrokAuthError("Grok API returned an unreadable response")
+
+
+def amount(value):
+  """Unwrap the {"val": N} envelope the billing endpoint wraps figures in."""
+  if isinstance(value, dict):
+    value = value.get("val")
+  try:
+    return float(value or 0)
+  except Exception:
+    return 0.0
+
+
+def billing_limits(config):
+  """Turn the billing config into the panel's limit rows.
+
+  Only ratios are reported. The endpoint's figures arrive as bare `val`
+  numbers with no unit anywhere in the response, so a percentage of an
+  allowance is the one thing that can be stated without guessing whether the
+  ledger counts dollars or credits — which is also why no `balance` block is
+  emitted here. A subscription with no credit pool reports every figure as
+  zero, and produces no rows at all.
+  """
+  resets_at = str(config.get("billingPeriodEnd") or "")
+  limits = []
+
+  monthly_limit = amount(config.get("monthlyLimit"))
+  if monthly_limit > 0:
+    limits.append({
+      "label": "Monthly credits",
+      "percent": min(1.0, max(0.0, amount(config.get("used")) / monthly_limit)),
+      "resetsAt": resets_at,
+    })
+
+  on_demand_cap = amount(config.get("onDemandCap"))
+  if on_demand_cap > 0:
+    # `used` is the current period's total; the on-demand slice of it only
+    # appears in the history rows, so read this period's from there.
+    on_demand_used = 0.0
+    period_start = str(config.get("billingPeriodStart") or "")[:7]
+    for cycle in config.get("history") or []:
+      if not isinstance(cycle, dict):
+        continue
+      billing_cycle = cycle.get("billingCycle") or {}
+      stamp = f"{number(billing_cycle.get('year')):04d}-{number(billing_cycle.get('month')):02d}"
+      if stamp == period_start:
+        on_demand_used = amount(cycle.get("onDemandUsed"))
+        break
+    limits.append({
+      "label": "On-demand cap",
+      "percent": min(1.0, max(0.0, on_demand_used / on_demand_cap)),
+      "resetsAt": resets_at,
+    })
+
+  return limits
+
+
+def plan_label():
+  """The plan name to show under the hero, from config only.
+
+  xAI hands the CLI a bare numeric `tier` claim and no name for it, and the
+  billing and user endpoints carry no plan field either, so there is nothing
+  to render that would not be a guess. Set `planLabel` in
+  ~/.config/omarchy/agents/grok.json to put one there.
+  """
+  config_home = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+  try:
+    config = json.loads((config_home / "omarchy" / "agents" / "grok.json").read_text(encoding="utf-8"))
+  except Exception:
+    return ""
+  if not isinstance(config, dict):
+    return ""
+  return str(config.get("planLabel") or "")
+
+
+def fetch_grok_api(base_url):
+  """Probe the CLI chat proxy for the account's credit ledger."""
+  result = {"limits": [], "tierLabel": plan_label(), "usageStatusText": "", "authHelpText": ""}
+  try:
+    token = read_access_token()
+    # /user is the cheap authentication check, and the only place the account
+    # is confirmed to still have CLI access at all.
+    user = api_get(base_url, "user", token)
+    if isinstance(user, dict) and user.get("hasGrokCodeAccess") is False:
+      result["usageStatusText"] = "This account has no Grok CLI access"
+    billing = api_get(base_url, "billing", token)
+    config = (billing or {}).get("config")
+    if isinstance(config, dict):
+      result["limits"] = billing_limits(config)
+  except GrokAuthError as error:
+    result["usageStatusText"] = "Grok limits unavailable"
+    result["authHelpText"] = str(error)
+  except Exception:
+    result["usageStatusText"] = "Grok limits unavailable"
+    result["authHelpText"] = AUTH_HELP
+    print("omarchy-agent-usage-grok: billing probe failed", file=sys.stderr)
+  return result
+
+
+def main():
+  parser = argparse.ArgumentParser(description="Print the Grok usage record as JSON")
+  # --force rescans everything and rewrites the cache. --limits-only is kept
+  # for CLI compatibility with the panel's refreshLimits() call: only the
+  # limits probe must be fresh, so it may reuse a scan for far longer than a
+  # normal run, whose short window exists purely to dedup concurrent
+  # collector runs.
+  parser.add_argument("--force", action="store_true")
+  parser.add_argument("--limits-only", action="store_true")
+  parser.add_argument("--api-base-url", default=os.environ.get("GROK_API_BASE_URL", API_BASE_URL))
+  args = parser.parse_args()
+
+  max_age = 0 if args.force else (LIMITS_ONLY_REUSE_SECONDS if args.limits_only else SCAN_REUSE_SECONDS)
+  stats = cached_local_stats(max_age)
+  api = fetch_grok_api(args.api_base_url)
+
+  record = {
+    "schemaVersion": 1,
+    "id": AGENT_ID,
+    "name": AGENT_NAME,
+    "updatedAt": datetime.now(timezone.utc).isoformat(),
+    "ready": True,
+    "hasLocalStats": True,
+  }
+  record.update(stats)
+  record.update(api)
+  print(json.dumps(record, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+  main()

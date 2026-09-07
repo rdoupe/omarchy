@@ -55,10 +55,12 @@ light surfaces — and the bar glyph stands in when there is none.
 | `claude` | Anthropic's OAuth usage endpoint (5-hour session + 7-day weekly) | `~/.claude/projects` transcripts, opencode sessions on an Anthropic provider, plus `stats-cache.json` and `history.jsonl` as fallback |
 | `codex` | The Codex app-server RPC | native Codex CLI session files (plus pi and opencode sessions) |
 | `fireworks` | Estimated prepaid balance: configured funding minus rated account costs | Fireworks billing API, grouped by day and model for the last 30 days |
+| `grok` | Monthly and on-demand credit allowances from the CLI chat proxy | native Grok CLI session transcripts, plus opencode sessions on an xAI provider |
 
 Claude limits need a signed-in CLI; without credentials the panel says so and
-falls back to local stats only. A non-default Claude directory is honored via
-`CLAUDE_CONFIG_DIR`, Codex via `CODEX_HOME`. Fireworks reads
+falls back to local stats only, and Grok's credit allowances behave the same
+way. A non-default Claude directory is honored via `CLAUDE_CONFIG_DIR`, Codex
+via `CODEX_HOME`, Grok via `GROK_HOME`. Fireworks reads
 `FIREWORKS_API_KEY` and `FIREWORKS_ACCOUNT_ID` first, then
 `~/.fireworks/auth.ini` (which `firectl set-api-key` creates), then the key
 opencode stores in `~/.local/share/opencode/auth.json` when Fireworks is
@@ -91,6 +93,41 @@ period. `accountId` only matters when one API key can access several
 accounts. Without a configured `fundedAmount` the tab still shows token
 usage, just no balance. With a live ledger, `fundedAmount` is optional and
 only adds the meter and the spent-of-funded line under the real figure.
+
+### Grok credits
+
+Grok's tokens come out of the session transcripts under `~/.grok/sessions`,
+where every completed turn records what it spent and on which models. Those
+numbers need no credentials at all, so the panel fills in whether or not the
+CLI is signed in.
+
+The allowance rows come from the chat proxy's billing endpoint, read with the
+access token `grok login` left in `~/.grok/auth.json`. Only percentages are
+published: the endpoint returns bare numbers with no unit anywhere in the
+response, so a share of an allowance is the one thing that can be shown
+without guessing whether the ledger counts dollars or credits — which is also
+why this collector emits no balance meter the way Fireworks does. An account
+whose usage is covered by a subscription reports every figure as zero and
+gets no rows, which is the honest answer rather than an empty gauge.
+
+That token is read and never refreshed. `auth.json` holds a refresh token
+beside it, but OIDC refresh tokens rotate on use, so spending one here would
+invalidate the copy the CLI is holding and sign you out of your own editor.
+An expired token is spotted from its own expiry claim before any request goes
+out, and the panel says to run `grok login` — the CLI refreshes it on its next
+start, and the rows come back on their own.
+
+xAI hands the CLI a bare numeric `tier` claim and no name for it, and neither
+the billing nor the user endpoint carries a plan field, so there is no plan
+line unless you write one:
+
+```json
+{
+  "planLabel": "SuperGrok Heavy"
+}
+```
+
+in `~/.config/omarchy/agents/grok.json`.
 
 ## Interactions
 
@@ -128,7 +165,8 @@ edit `shell.json` directly):
 omarchy bar set omarchy.agents providers '{
   "claude": { "enabled": true },
   "codex": { "enabled": false },
-  "fireworks": { "enabled": true }
+  "fireworks": { "enabled": true },
+  "grok": { "enabled": true }
 }' --json
 ```
 
@@ -144,7 +182,7 @@ when its stats are account-global rather than machine-local (Fireworks'
 billing API); those merge by taking the widest value instead of summing, so
 the same account synced from two machines is not counted twice.
 
-One caveat on "all-time": the Codex collector only reads native session files
-touched in the last 30 days, and Fireworks requests the last 30 days from its
-billing API, so their totals and day counts cover that window. Claude's cover
-every transcript still on disk.
+One caveat on "all-time": the Codex and Grok collectors only read native
+session files touched in the last 30 days, and Fireworks requests the last 30
+days from its billing API, so their totals and day counts cover that window.
+Claude's cover every transcript still on disk.
